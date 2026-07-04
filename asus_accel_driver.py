@@ -4,6 +4,9 @@ import sys
 import importlib
 import logging
 import os
+import glob
+import time
+import threading
 from typing import Optional
 from libevdev import Device, EV_SW, EV_KEY, EV_SYN, InputEvent
 from time import sleep
@@ -15,73 +18,27 @@ logging.basicConfig(
 )
 log = logging.getLogger('Asus Accel Tablet Mode Driver')
 
-# UN5401QAB_UN5401QA:
-#
-# 2024-01-07 19:36:22,134 INFO     E: DRIVER=hid_sensor_accel_3d
-# 2024-01-07 19:36:22,962 INFO     E: MODALIAS=platform:HID-SENSOR-200073
-# 2024-01-07 19:36:23,811 INFO     E: USEC_INITIALIZED=6069275
-# 2024-01-07 19:36:24,235 INFO     E: ID_PATH=platform-HID-SENSOR-200073.1.auto
-# 2024-01-07 19:36:24,710 INFO     E: ID_PATH_TAG=platform-HID-SENSOR-200073_1_auto
-# 2024-01-07 19:36:25,363 INFO     
-# 2024-01-07 19:36:26,326 INFO     P: /devices/0020:1022:0001.0001/HID-SENSOR-200073.1.auto/iio:device0
-# 2024-01-07 19:36:26,868 INFO     N: iio:device0
-# 2024-01-07 19:36:27,315 INFO     L: 0
-# 2024-01-07 19:36:27,823 INFO     E: DEVPATH=/devices/0020:1022:0001.0001/HID-SENSOR-200073.1.auto/iio:device0
-# 2024-01-07 19:36:28,302 INFO     E: SUBSYSTEM=iio
-# 2024-01-07 19:37:36,067 INFO     E: DEVNAME=/dev/iio:device0
-# 2024-01-07 19:37:36,802 INFO     E: DEVTYPE=iio_device
-# 2024-01-07 19:37:58,027 INFO     E: MAJOR=511
-# 2024-01-07 19:37:58,679 INFO     E: MINOR=0
-# 2024-01-07 19:37:59,236 INFO     E: USEC_INITIALIZED=6165210
-# 2024-01-07 19:37:59,902 INFO     E: IIO_SENSOR_PROXY_TYPE=iio-poll-accel iio-buffer-accel
-# 2024-01-07 19:38:06,034 INFO     E: SYSTEMD_WANTS=iio-sensor-proxy.service
-# 2024-01-07 19:38:07,557 INFO     E: TAGS=:systemd:
-# 2024-01-07 19:38:08,791 INFO     E: CURRENT_TAGS=:systemd:
-# 2024-01-07 19:38:09,620 INFO     
-# 2024-01-07 19:38:10,450 INFO     P: /devices/0020:1022:0001.0001/HID-SENSOR-200073.1.auto/trigger0
-# 2024-01-07 19:38:12,734 INFO     L: 0
-# 2024-01-07 19:38:13,388 INFO     E: DEVPATH=/devices/0020:1022:0001.0001/HID-SENSOR-200073.1.auto/trigger0
-# 2024-01-07 19:38:16,206 INFO     E: SUBSYSTEM=iio
-# 2024-01-07 19:38:16,858 INFO
-
-accel_detected = 0
-accel_device_dir_path: Optional[str] = None
-
-cmd = ["udevadm", "info", "--export-db"]
-proc = subprocess.Popen(cmd, stdout=subprocess.PIPE)
-for bytes_line in proc.stdout.readlines():
-    try:
-        line = bytes_line.decode("utf-8")
-    except UnicodeDecodeError:
-        log.error("Output of udevadm info --export-db has invalid (non utf-8) characters")
-        exit(1)
-
-    if accel_detected == 0 and "accel" in line:
-        accel_detected = 1
-
-    if accel_detected == 1:
-        if "P: " in line:
-            accel_device_dir_path = "/sys" + line.split(" ")[1].replace("\n", "")
-            accel_detected = 2
-            break
-
-if accel_detected != 2:
-    log.error("Can't find accel sensor (code: %s)", accel_detected)
-    sys.exit(1)
-if accel_detected == 2 and not accel_device_dir_path:
-    log.error("Can't find accel sensor device path")
-    sys.exit(1)
+DEBOUNCE_S = 0.3
+# After suspend/resume: force laptop mode and ignore hinge events for this long.
+# Firmware can replay a spurious KEY_PROG2 on wake, and the accelerometer is not
+# a reliable orientation source (raw values are unscaled and only one flat pose
+# is detectable), so laptop mode is always assumed on resume.
+RESUME_GRACE_S = 3.0
+RESUME_POLL_S = 2.0
+RESUME_DRIFT_THRESHOLD_S = 3.0
 
 
 # Layout
-layout = 'default'
-if len(sys.argv) > 1:
-    layout = sys.argv[1]
+layout_name = 'default'
+if len(sys.argv) > 1 and not sys.argv[1].startswith('--'):
+    layout_name = sys.argv[1]
 try:
-    layout = importlib.import_module('conf.' + layout)
-except:
+    layout = importlib.import_module('conf.' + layout_name)
+except Exception:
     log.error("Layout *.py from dir conf is required as first argument. Re-run install script or add missing first argument (valid value is default, ..).")
     sys.exit(1)
+
+no_grab = '--no-grab' in sys.argv
 
 
 def isEventKey(key):
@@ -111,21 +68,16 @@ for event_to_enable in layout.tablet_mode_events:
     if isEventInput(event_to_enable):
         dev.enable(event_to_enable.code)
 
-# Sleep for a bit so udev, libinput, Xorg, Wayland, ... all have had
-# a chance to see the device and initialize it. Otherwise the event
-# will be sent by the kernel but nothing is ready to listen to the
-# device yet
+# Sleep so udev, libinput, Xorg, Wayland have had a chance to see the device
 udev = dev.create_uinput_device()
 sleep(1)
 
 
 def flip(tablet_mode):
-
     keys_to_send_press_events = []
     keys_to_send_release_events = []
     events_to_send = []
 
-    # Keys
     for keys_to_send_press in layout.flip_keys:
         if isEventKey(keys_to_send_press):
             keys_to_send_press_events.append(InputEvent(keys_to_send_press, 1))
@@ -133,7 +85,6 @@ def flip(tablet_mode):
         if isEventKey(keys_to_send_release):
             keys_to_send_release_events.append(InputEvent(keys_to_send_release, 0))
 
-    # Events
     if tablet_mode:
         for event_to_send in layout.tablet_mode_events:
             if isEventInput(event_to_send):
@@ -143,10 +94,7 @@ def flip(tablet_mode):
             if isEventInput(event_to_send):
                 events_to_send.append(event_to_send)
 
-    # Sync event
-    sync_event = [
-        InputEvent(EV_SYN.SYN_REPORT, 0)
-    ]
+    sync_event = [InputEvent(EV_SYN.SYN_REPORT, 0)]
 
     try:
         udev.send_events(keys_to_send_press_events)
@@ -159,28 +107,114 @@ def flip(tablet_mode):
         log.error("Cannot send event, %s", e)
 
 
-def read_accel_file(name):
-    fp = open(os.path.join(accel_device_dir_path, name))
-    fp.seek(0)
-    return float(fp.read()) #* 1 # TODO: * scale?
+def find_accel_device() -> Optional[str]:
+    """Return the sysfs path of the IIO accelerometer, or None if not found."""
+    cmd = ["udevadm", "info", "--export-db"]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE)
+    accel_detected = 0
+    for bytes_line in proc.stdout.readlines():
+        try:
+            line = bytes_line.decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+        if accel_detected == 0 and "accel" in line:
+            accel_detected = 1
+        elif accel_detected == 1 and "P: " in line:
+            return "/sys" + line.split(" ")[1].rstrip()
+    return None
 
-tablet_mode = False
 
-while True:
-    x = read_accel_file("in_accel_x_raw")
-    y = read_accel_file("in_accel_y_raw")
-    z = read_accel_file("in_accel_z_raw")
+def infer_initial_tablet_mode() -> bool:
+    """Read accelerometer once at startup to guess current physical orientation."""
+    accel_path = find_accel_device()
+    if not accel_path:
+        log.warning("Accelerometer not found; assuming laptop mode at startup")
+        return False
+    try:
+        def _read(name):
+            with open(os.path.join(accel_path, name)) as f:
+                return float(f.read())
+        x = _read("in_accel_x_raw")
+        y = _read("in_accel_y_raw")
+        z = _read("in_accel_z_raw")
+        is_tablet = (abs(x) <= 5 and abs(y) <= 5 and z <= -9)
+        log.info("Initial state from accelerometer: %s (x=%.1f y=%.1f z=%.1f)",
+                 "tablet" if is_tablet else "laptop", x, y, z)
+        return is_tablet
+    except OSError as e:
+        log.warning("Could not read accelerometer: %s; assuming laptop mode", e)
+        return False
 
-    criterium_for_accel_be_recognized_as_tablet_mode = ((x >= -5 and x <= 5) and (y >= -5 and y <= 5) and z <= -9)
 
-    # Call only once when is state changed
-    if criterium_for_accel_be_recognized_as_tablet_mode and tablet_mode is False:
-        tablet_mode = True
-        flip(tablet_mode)
-        log.info("Flip to tablet mode")
-    elif not criterium_for_accel_be_recognized_as_tablet_mode and tablet_mode is True:
-        tablet_mode = False
-        flip(tablet_mode)
-        log.info("Flip to laptop mode")
+def find_wmi_hotkey_device() -> str:
+    """Return the /dev/input/eventN path for the Asus WMI hotkeys device."""
+    for path in sorted(glob.glob("/dev/input/event*")):
+        try:
+            with open(path, 'rb') as f:
+                d = Device(f)
+                if d.name == "Asus WMI hotkeys" or (d.phys and "asus-nb-wmi" in d.phys):
+                    log.info("Found WMI hotkey device: %s (%s)", path, d.name)
+                    return path
+        except (OSError, PermissionError):
+            continue
+    raise RuntimeError("Asus WMI hotkeys device not found in /dev/input/ — is asus-nb-wmi loaded?")
 
-    sleep(0.5)
+
+tablet_mode = infer_initial_tablet_mode()
+
+state_lock = threading.Lock()
+last_resume_time = 0.0
+
+
+def _suspend_drift():
+    """BOOTTIME advances during suspend while MONOTONIC pauses; the gap grows on resume."""
+    return time.clock_gettime(time.CLOCK_BOOTTIME) - time.monotonic()
+
+
+def resume_watcher():
+    global tablet_mode, last_resume_time
+    drift = _suspend_drift()
+    while True:
+        sleep(RESUME_POLL_S)
+        new_drift = _suspend_drift()
+        if new_drift - drift >= RESUME_DRIFT_THRESHOLD_S:
+            log.info("Resume from suspend detected (slept ~%.0fs); forcing laptop mode",
+                     new_drift - drift)
+            with state_lock:
+                tablet_mode = False
+                last_resume_time = time.monotonic()
+            flip(False)
+        drift = new_drift
+
+
+threading.Thread(target=resume_watcher, daemon=True).start()
+
+wmi_path = find_wmi_hotkey_device()
+wmi_fd = open(wmi_path, 'rb')
+wmi_dev = Device(wmi_fd)
+
+if not no_grab:
+    wmi_dev.grab()
+    log.debug("Grabbed %s exclusively", wmi_path)
+
+log.info("Listening for hinge events on %s (grab=%s)", wmi_path, not no_grab)
+
+# Broadcast initial state so SW_TABLET_MODE is not stale after a driver restart
+flip(tablet_mode)
+
+last_toggle_time = 0.0
+
+for event in wmi_dev.events():
+    if event.matches(EV_KEY.KEY_PROG2) and event.value == 1:
+        now = time.monotonic()
+        with state_lock:
+            if now - last_resume_time < RESUME_GRACE_S:
+                log.info("Ignoring hinge event within %.0fs of resume", RESUME_GRACE_S)
+                continue
+            if now - last_toggle_time < DEBOUNCE_S:
+                continue
+            last_toggle_time = now
+            tablet_mode = not tablet_mode
+            new_mode = tablet_mode
+        flip(new_mode)
+        log.info("Hinge event → %s", "tablet" if new_mode else "laptop")
