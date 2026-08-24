@@ -62,6 +62,10 @@ LOGS_INSTALL_LOG_FILE_PATH="$LOGS_DIR_PATH/$LOGS_INSTALL_LOG_FILE_NAME"
 
     echo
 
+    source install_break_glass.sh
+
+    echo
+
     echo "Installation finished succesfully"
 
     echo

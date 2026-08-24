@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+#
+# Break-glass helper: force the driver back to laptop mode.
+#
+# Runs from a launcher icon so it can be triggered by touch alone, which matters
+# because the built-in keyboard and touchpad are disabled while the system is
+# stuck in tablet mode.
+
+SERVICE="asus_accel_tablet_mode_driver@$USER.service"
+
+notify() {
+    command -v notify-send >/dev/null 2>&1 && notify-send -a "Tablet Mode" "$1" "$2"
+    echo "$1: $2"
+}
+
+if ! systemctl --user is-active --quiet "$SERVICE"; then
+    systemctl --user restart "$SERVICE"
+    notify "Laptop mode restored" "Driver was not running and has been restarted."
+    exit $?
+fi
+
+# SIGUSR1 makes the driver re-assert laptop mode, replay a tablet->laptop edge
+# and re-create its switch device, so a compositor holding a stale tablet state
+# has to let go of it.
+if systemctl --user kill --kill-whom=main -s SIGUSR1 "$SERVICE" 2>/dev/null \
+    || systemctl --user kill --kill-who=main -s SIGUSR1 "$SERVICE" 2>/dev/null \
+    || systemctl --user kill -s SIGUSR1 "$SERVICE" 2>/dev/null \
+    || pkill -USR1 -f asus_accel_driver.py; then
+    notify "Laptop mode restored" "Keyboard and touchpad should be usable again."
+    exit 0
+fi
+
+# Last resort: a restart rebuilds the switch device from scratch.
+systemctl --user restart "$SERVICE"
+notify "Laptop mode restored" "Driver restarted."

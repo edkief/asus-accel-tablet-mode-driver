@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Unstick Tablet Mode
+Comment=Force laptop mode when the keyboard and touchpad stay disabled
+Exec=/usr/bin/asus-tablet-mode-unstick
+Icon=input-tablet
+Terminal=false
+Categories=Utility;System;
+Keywords=tablet;laptop;keyboard;touchpad;unstick;flip;
+StartupNotify=false

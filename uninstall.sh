@@ -30,6 +30,10 @@ LOGS_UNINSTALL_LOG_FILE_PATH="$LOGS_DIR_PATH/$LOGS_UNINSTALL_LOG_FILE_NAME"
 
 	echo
 
+	source uninstall_break_glass.sh
+
+	echo
+
 	echo "Uninstallation finished succesfully"
 
 	echo

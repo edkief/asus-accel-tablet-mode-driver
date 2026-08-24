@@ -66,6 +66,12 @@ or run separately parts of the install script
 $ bash install_service.sh
 ```
 
+- install the break-glass launcher (see [Stuck in tablet mode](#stuck-in-tablet-mode))
+
+```bash
+$ bash install_break_glass.sh
+```
+
 ## Uninstallation
 
 To uninstall run
@@ -78,6 +84,43 @@ or run separately parts of the uninstall script
 
 ```bash
 $ bash uninstall_service.sh
+$ bash uninstall_break_glass.sh
+```
+
+## Stuck in tablet mode
+
+The machine can come back from suspend with tablet mode still asserted, which leaves
+the built-in keyboard and touchpad disabled. Two things cause it and both are handled:
+
+1. The firmware replays the hinge event (`KEY_PROG2`) on wake. Those queued events are
+   stale, so on resume the driver discards everything the hinge device queued while
+   asleep, forces laptop mode and ignores hinge events for 3 seconds.
+2. The compositor can hold on to a tablet state of its own. Re-sending
+   `SW_TABLET_MODE 0` cannot fix that, because the kernel drops a switch value equal to
+   the current one, so no event is ever delivered. Instead the driver destroys and
+   re-creates its virtual switch device once the resume grace window closes: libinput
+   sees the device go away and come back reading `0`, which is the same recovery the
+   manual rotate-to-portrait-and-back workaround triggers indirectly.
+
+### Break-glass launcher
+
+If input is ever disabled anyway, the recovery has to be reachable without a keyboard
+or a touchpad. `install_break_glass.sh` installs an **Unstick Tablet Mode** launcher;
+pin it to the GNOME dash (Activities, long press the icon, *Pin to Dash*) and one touch
+restores laptop mode. It sends `SIGUSR1` to the driver, which replays a
+tablet-to-laptop edge and re-creates the switch device, and restarts the service if the
+driver is not running.
+
+The same thing from a terminal or over SSH:
+
+```bash
+$ asus-tablet-mode-unstick
+```
+
+or, without the helper installed:
+
+```bash
+$ systemctl --user kill -s SIGUSR1 asus_accel_tablet_mode_driver@$USER.service
 ```
 
 **Troubleshooting**
